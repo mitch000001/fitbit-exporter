@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<html>
+    <body>
+        <h1>Authorize with Fitbit</h1>
+        <form action="/authorize">
+            <label for="auth-redirect">Custom redirect URL</label>
+            <input type="text" id="auth-redirect"><br><br>
+            <label for="auth-submit">This </label>
+            <input id="auth-submit" type="submit" value="Authorize">
+        </form>
+        <script type="text/javascript">
+            document.getElementById('auth-redirect').value = document.URL
+        </script>
+    </body>
+</html>
