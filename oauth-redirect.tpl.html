@@ -1,0 +1,11 @@
+<!DOCTYPE html>
+<html>
+    <body>
+        <h1>Authorization with Fitbit successfully</h1>
+        <p>You successfully authorized this exporter to fetch your data from Fitbit for the following scopes:</p>
+        <ul>{{- range $scope := .scopes }}
+        <li>{{ $scope }}</li>
+        {{ end -}}</ul>
+        To <a href="/metrics">metrics</a>
+    </body>
+</html>
