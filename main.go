@@ -1,32 +1,63 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
-	"html/template"
 	"io"
 	"log"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/kr/pretty"
+	"github.com/mitch000001/fitbit-exporter/pkg/fitbit"
+	"github.com/mitch000001/fitbit-exporter/pkg/http/handler"
+	"github.com/mitch000001/fitbit-exporter/pkg/http/oauth"
+	"github.com/mitch000001/fitbit-exporter/pkg/http/rate"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/oauth2"
-	"golang.org/x/oauth2/fitbit"
+	oauth_fitbit "golang.org/x/oauth2/fitbit"
 )
 
+func init() {
+	// Register all of the metrics in the standard registry.
+	prometheus.MustRegister(
+		clientRequestCounter, tlsLatencyVec, dnsLatencyVec, histVec, inFlightGauge,
+		rateLimiterLimitGauge, rateLimiterRemainingGauge, rateLimiterResetsAfterGauge,
+	)
+}
+
 func main() {
-	conf := &OauthConfig{
-		State: uuid.NewString(),
+	rateLimitHeaderKeys := rate.HeaderKeys{
+		LimitKey:       "Fitbit-Rate-Limit-Limit",
+		RemainingKey:   "Fitbit-Rate-Limit-Remaining",
+		ResetsAfterKey: "Fitbit-Rate-Limit-Reset",
+	}
+	rl, err := rate.NewFromHeader(rateLimitHeaderKeys)
+	if err != nil {
+		log.Printf("Error initializing rate limiter: %v", err)
+		os.Exit(1)
+	}
+	tokenCache, err := oauth.NewJSONFileTokenCache(os.Getenv("OAUTH2_TOKEN_FILE"))
+	if err != nil {
+		log.Printf("Error initializing token cache: %v", err)
+		os.Exit(1)
+	}
+	conf := &oauth.Config{
+		State:               uuid.NewString(),
+		RateLimiter:         rl,
+		InstrumentTransport: instrumentTransport(rateLimitHeaderKeys),
 		Config: &oauth2.Config{
 			ClientID:     os.Getenv("OAUTH2_CLIENT_ID"),
 			ClientSecret: os.Getenv("OAUTH2_CLIENT_SECRET"),
+			RedirectURL:  os.Getenv("OAUTH2_REDIRECT_URL"),
 			Scopes: []string{
 				"activity",
 				"heartrate",
@@ -38,19 +69,20 @@ func main() {
 				"social",
 				"weight",
 			},
-			Endpoint: fitbit.Endpoint,
+			Endpoint: oauth_fitbit.Endpoint,
 		},
-		AuthCode: os.Getenv("OAUTH2_AUTH_CODE"),
+	}
+	if err := conf.SetTokenCache(tokenCache); err != nil {
+		log.Printf("Error setting token cache: %v", err)
+		os.Exit(1)
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/auth", oauthHandler(conf))
-	mux.HandleFunc("/authorize", authorizeHandler(conf))
-	mux.HandleFunc("/oauth-redirect", oauthRedirectHandler(conf))
-	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "Not found", http.StatusNotFound)
-	})
-	mux.HandleFunc("/", handler(conf))
+	mux.HandleFunc("/auth", handler.OauthHandler())
+	mux.HandleFunc("/authorize", handler.AuthorizeHandler(conf))
+	mux.HandleFunc("/oauth-redirect", handler.OauthRedirectHandler(conf))
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/", handler.AuthMiddleware(conf, handler.Handler()))
 	server := &http.Server{
 		Addr:    ":3000",
 		Handler: mux,
@@ -62,6 +94,7 @@ func main() {
 			log.Printf("Error starting listening server: %v", err)
 		}
 	}()
+	cancelFn := startMetricCollector(conf)
 	sigs := make(chan os.Signal, 1)
 	done := make(chan bool, 1)
 
@@ -76,6 +109,7 @@ func main() {
 		if err := server.Shutdown(timeoutCtx); err != nil {
 			log.Printf("Error shutting down server: %v", err)
 		}
+		cancelFn()
 		cancel()
 		done <- true
 	}()
@@ -85,134 +119,72 @@ func main() {
 
 }
 
-func handler(config *OauthConfig) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if !config.IsAuthorized() {
-			http.Redirect(w, r, "/auth", http.StatusTemporaryRedirect)
-			return
+func startMetricCollector(clientProvider oauth.ClientProvider) func() {
+	cancel := make(chan bool, 1)
+	go func(clientProvider oauth.ClientProvider) {
+		for {
+			ctx := context.Background()
+			ctx, cancelFn := context.WithCancel(ctx)
+			select {
+			case <-cancel:
+				cancelFn()
+				return
+			case <-time.Tick(10 * time.Second):
+				scrapeMetrics(ctx, clientProvider)
+				cancelFn()
+			}
 		}
-		tok, err := config.Exchange(r.Context(), config.AuthCode, oauth2.AccessTypeOffline)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Error exchanging token: %v", err), http.StatusInternalServerError)
-			return
-		}
-		log.Printf("Token: %+#v\n", tok)
-		client := config.Client(r.Context(), tok)
-
-		res, err := client.PostForm("https://api.fitbit.com/1.1/oauth2/introspect", url.Values{"token": []string{tok.AccessToken}})
-		if err != nil {
-			log.Printf("Error introspecting token: %v", err)
-		}
-		if err := printResponse(res); err != nil {
-			log.Printf("Error reading token introspect response: %v", err)
-		}
-		res, err = client.Get("https://api.fitbit.com/1/user/-/profile.json")
-		if err != nil {
-			log.Printf("Error getting devices: %v", err)
-		}
-		if err := printResponse(res); err != nil {
-			log.Printf("Error reading devices: %v", err)
-		}
-		fmt.Fprint(w, `<!DOCTYPE html>
-        <html>
-            <body>
-                <h1>Fitbit exporter</h1>
-                <p>You successfully authorized this exporter to fetch your data from Fitbit</p>
-                <p>Visit the metrics endpoint at <a href="/metrics">/metrics</a></p>
-            </body>
-        </html>
-        `)
+	}(clientProvider)
+	return func() {
+		cancel <- true
 	}
 }
 
-func oauthHandler(config *OauthConfig) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if err := authTemplate.Execute(w, "auth.tpl.html"); err != nil {
-			http.Error(w, fmt.Sprintf("error while executing template: %v", err), http.StatusInternalServerError)
-		}
-	}
-}
-
-func authorizeHandler(config *OauthConfig) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if err := r.ParseForm(); err != nil {
-			http.Error(w, fmt.Sprintf("error parsing form: %v", err), http.StatusBadRequest)
-		}
-		redirectURL, err := url.Parse(r.Form.Get("redirectURL"))
-		if err != nil {
-			log.Printf("Error parsing redirect URL: %v", err)
-		} else {
-			redirectURL.Path = "/oauth-redirect"
-			config.RedirectURL = redirectURL.String()
-		}
-		fitbitURL := config.AuthCodeURL(config.State, oauth2.AccessTypeOffline)
-		http.Redirect(w, r, fitbitURL, http.StatusTemporaryRedirect)
-	}
-}
-
-func oauthRedirectHandler(config *OauthConfig) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		params := r.URL.Query()
-		authCode := params.Get("code")
-		state := params.Get("state")
-		if !config.IsStateValid(state) {
-			http.Error(w, "State does not match", http.StatusBadRequest)
-			return
-		}
-		config.AuthCode = authCode
-		templateValues := map[string]interface{}{
-			"scopes": config.Scopes,
-		}
-		if err := oauthRedirectTemplate.ExecuteTemplate(w, "oauth-redirect.tpl.html", templateValues); err != nil {
-			http.Error(w, fmt.Sprintf("error while executing template: %v", err), http.StatusInternalServerError)
-		}
-	}
-}
-
-var authTemplate = template.Must(template.ParseFiles("./auth.tpl.html"))
-var oauthRedirectTemplate = template.Must(template.ParseFiles("./oauth-redirect.tpl.html"))
-
-type logTransport struct {
-	transport http.RoundTripper
-}
-
-func (l *logTransport) RoundTrip(request *http.Request) (*http.Response, error) {
-	req, err := httputil.DumpRequest(request, true)
+func scrapeMetrics(ctx context.Context, clientProvider oauth.ClientProvider) {
+	client, err := clientProvider.Client(ctx)
 	if err != nil {
-		log.Printf("Error dumping request: %v", err)
+		log.Printf("Error getting client: %v\n", err)
+		return
 	}
-	log.Println(string(req))
-	response, err := l.transport.RoundTrip(request)
-	res, err := httputil.DumpResponse(response, true)
+
+	// res, err := client.PostForm("https://api.fitbit.com/1.1/oauth2/introspect", url.Values{"token": []string{tok.AccessToken}})
+	// if err != nil {
+	// 	log.Printf("Error introspecting token: %v", err)
+	// 	return
+	// }
+	// if err := printResponse(res); err != nil {
+	// 	log.Printf("Error reading token introspect response: %v", err)
+	// 	return
+	// }
+	now := time.Now()
+	now10Sec := now.Truncate(60 * time.Minute).Format("15:04")
+	time := now.Format("15:04")
+	res, err := client.Get(fmt.Sprintf("https://api.fitbit.com/1/user/-/activities/heart/date/today/1d/1sec/time/%s/%s.json", now10Sec, time))
 	if err != nil {
-		log.Printf("Error dumping request: %v", err)
+		log.Printf("Error getting heartrate: %v", err)
 	}
-	log.Println(string(res))
-	return response, err
+	var buf bytes.Buffer
+	var heartRates fitbit.HeartRateResult
+	if err := json.NewDecoder(io.TeeReader(res.Body, &buf)).Decode(&heartRates); err != nil {
+		log.Printf("Error parsing heartrate: %v", err)
+	}
+	pretty.Printf("Heartrates:\n%# v\n", heartRates)
+	// if err := printResponse(&buf); err != nil {
+	// 	log.Printf("Error reading profile: %v", err)
+	// 	return
+	// }
+	log.Println("Metrics scraped")
 }
 
-func printResponse(response *http.Response) error {
-	body, err := io.ReadAll(response.Body)
+func printResponse(body io.Reader) error {
+	bodyBytes, err := io.ReadAll(body)
 	if err != nil {
 		return errors.Wrap(err, "error reading body")
 	}
-	log.Printf("Response: \n%s\n", string(body))
+	var buf bytes.Buffer
+	if err := json.Indent(&buf, bodyBytes, "", "  "); err != nil {
+		log.Printf("Response: \n%s\n", string(bodyBytes))
+	}
+	log.Printf("Response: \n%s\n", buf.String())
 	return nil
-}
-
-type OauthConfig struct {
-	*oauth2.Config
-	AuthCode string
-	State    string
-	sync.Mutex
-}
-
-func (o OauthConfig) IsAuthorized() bool {
-	o.Lock()
-	defer o.Unlock()
-	return o.AuthCode != ""
-}
-
-func (o OauthConfig) IsStateValid(state string) bool {
-	return o.State == state
 }
